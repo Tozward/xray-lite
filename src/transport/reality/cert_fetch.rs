@@ -4,8 +4,36 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::BytesMut;
 
 /// 从目标服务器获取 TLS 证书
-pub async fn fetch_certificate(dest: &str) -> Result<Vec<u8>> {
-    // 解析目标地址
+pub async fn fetch_certificate(dest: &str, sni: &str) -> Result<Vec<u8>> {
+    // 发送一个简单的 ClientHello 来触发 ServerHello + Certificate
+    let client_hello = build_simple_client_hello(sni)?;
+    // 读取响应并提取证书
+    let mut buf = BytesMut::with_capacity(8192);
+
+    #[cfg(unix)]
+    if dest.starts_with('/') || dest.starts_with('@') {
+        use tokio::net::UnixStream;
+        let path = if dest.starts_with('@') {
+            dest.replacen('@', "\0", 1)
+        } else {
+            dest.to_string()
+        };
+        
+        let mut stream = UnixStream::connect(&path).await
+            .map_err(|e| anyhow!("Failed to connect to UDS {}: {}", path, e))?;
+        
+        stream.write_all(&client_hello).await?;
+        
+        loop {
+            let n = stream.read_buf(&mut buf).await?;
+            if n == 0 || buf.len() > 8192 {
+                break;
+            }
+        }
+        return extract_certificate_from_response(&buf);
+    }
+
+    // 解析目标地址 (TCP 回退)
     let addr = if dest.contains(':') {
         dest.to_string()
     } else {
@@ -13,15 +41,10 @@ pub async fn fetch_certificate(dest: &str) -> Result<Vec<u8>> {
     };
     
     // 连接到目标服务器
-    let mut stream = TcpStream::connect(&addr).await
+    let mut stream = tokio::net::TcpStream::connect(&addr).await
         .map_err(|e| anyhow!("Failed to connect to {}: {}", addr, e))?;
     
-    // 发送一个简单的 ClientHello 来触发 ServerHello + Certificate
-    let client_hello = build_simple_client_hello(dest)?;
     stream.write_all(&client_hello).await?;
-    
-    // 读取响应并提取证书
-    let mut buf = BytesMut::with_capacity(8192);
     
     loop {
         let n = stream.read_buf(&mut buf).await?;

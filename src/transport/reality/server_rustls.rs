@@ -114,7 +114,7 @@ impl RealityServerRustls {
 
                 // 当 dest 为 UDS 路径时无法作为有效的 DNS 名称生成证书
                 // 故，优先使用客户端握手携带的真实 SNI，其次回退到配置允许的第一个 server_name，最后设为默认值
-                let cert_host = info.server_name.as_deref()
+                let dest_host = info.server_name.as_deref()
                     .or_else(|| self.server_names.first().map(|s| s.as_str()))
                     .unwrap_or("www.microsoft.com");
                 
