@@ -110,10 +110,13 @@ impl RealityServerRustls {
                 warn!("Reality SNI mismatch: {:?} (Allowed: {:?})", info.server_name, self.server_names);
                 // Fallthrough to fallback (don't verify reality)
             } else if let Some((offset, auth_key)) = self.verify_client_reality(&info, &buffer) {
-                let dest_str = self.reality_config.dest.as_deref().unwrap_or("www.microsoft.com");
-                let dest_host = dest_str.split(':').next().unwrap_or("www.microsoft.com");
-
                 info!("Reality: Verified client (Offset {}), generating dynamic signature-certificate", offset);
+
+                // 当 dest 为 UDS 路径时无法作为有效的 DNS 名称生成证书
+                // 故，优先使用客户端握手携带的真实 SNI，其次回退到配置允许的第一个 server_name，最后设为默认值
+                let cert_host = info.server_name.as_deref()
+                    .or_else(|| self.server_names.first().map(|s| s.as_str()))
+                    .unwrap_or("www.microsoft.com");
                 
                 let (cert, key) = self.generate_reality_cert(&auth_key, dest_host)?;
 
@@ -266,14 +269,45 @@ impl RealityServerRustls {
 
     async fn fallback<S>(&self, mut stream: S, prefix: &[u8], dest: &str) -> Result<()> 
     where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+        let is_uds = dest.starts_with('/') || dest.starts_with('@');
+
+        #[cfg(unix)]
+        if is_uds {
+            use tokio::net::UnixStream;
+            let mut path = dest.to_string();
+            // Xray 标准：支持 Linux Abstract Socket (以 @ 开头映射为 \0)
+            if path.starts_with('@') {
+                path.replace_range(0..1, "\0");
+            }
+
+            let mut dest_stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                UnixStream::connect(path)
+            ).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(anyhow!("Fallback UDS connection error: {}", e)),
+                Err(_) => bail!("Fallback UDS connection timeout"),
+            };
+            
+            dest_stream.write_all(prefix).await?;
+            tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+            return Ok(());
+        }
+
+        #[cfg(not(unix))]
+        if is_uds {
+            bail!("Unix Domain Socket fallback is not supported on this platform");
+        }
+
+        // 默认 TCP 回退逻辑
         // 核心修复：为回退连接添加超时保护 (10s)
         let mut dest_stream = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             TcpStream::connect(dest)
         ).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => bail!("Fallback connection timeout"),
+            Ok(Err(e)) => return Err(anyhow!("Fallback TCP connection error: {}", e)),
+            Err(_) => bail!("Fallback TCP connection timeout"),
         };
         dest_stream.write_all(prefix).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
